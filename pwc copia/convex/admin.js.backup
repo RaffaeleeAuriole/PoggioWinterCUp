@@ -1,0 +1,136 @@
+import { mutation, query } from "./_generated/server";
+import { v } from "convex/values";
+import { getAuthUserId } from "@convex-dev/auth/server";
+import { activeEdition, requireAdmin } from "./lib";
+
+// Chiusura/correzione partita: una sola transazione (Convex e' transazionale) e rieseguibile senza doppi conteggi.
+export const closeMatch = mutation({
+  args: {
+    matchId: v.id("matches"), homeGoals: v.number(), awayGoals: v.number(), walkover: v.optional(v.boolean()),
+    goals: v.array(v.object({ playerId: v.id("players"), teamId: v.id("teams"), ownGoal: v.boolean() })),
+  },
+  handler: async (ctx, a) => {
+    await requireAdmin(ctx);
+    const m = await ctx.db.get(a.matchId);
+    if (!m) throw new Error("Partita non trovata");
+    if (m.status === "cancelled") throw new Error("Partita annullata");
+    if (!Number.isInteger(a.homeGoals) || !Number.isInteger(a.awayGoals) || a.homeGoals < 0 || a.awayGoals < 0) throw new Error("Risultato non valido");
+    if (a.walkover && a.goals.length) throw new Error("Vittoria a tavolino: nessun marcatore");
+    let home = 0, away = 0;
+    for (const g of a.goals) {
+      if (g.teamId !== m.homeTeamId && g.teamId !== m.awayTeamId) throw new Error("Squadra del marcatore non valida");
+      if (!(await ctx.db.get(g.playerId))) throw new Error("Giocatore non trovato");
+      if ((g.teamId === m.homeTeamId) !== g.ownGoal) home++; else away++;   // autogol: il gol va agli avversari
+    }
+    if (!a.walkover && (home !== a.homeGoals || away !== a.awayGoals)) throw new Error(`I marcatori (${home}-${away}) non corrispondono al risultato (${a.homeGoals}-${a.awayGoals})`);
+    const old = await ctx.db.query("matchGoals").withIndex("by_match", (q) => q.eq("matchId", m._id)).collect();
+    for (const o of old) await ctx.db.delete(o._id);
+    for (const g of a.goals) await ctx.db.insert("matchGoals", { editionId: m.editionId, matchId: m._id, ...g });
+    await ctx.db.patch(m._id, { homeGoals: a.homeGoals, awayGoals: a.awayGoals, status: "finished", walkover: !!a.walkover });
+  },
+});
+
+export const transferPlayer = mutation({
+  args: { playerId: v.id("players"), toTeamId: v.id("teams"), date: v.string(), note: v.optional(v.string()), newNumber: v.optional(v.number()) },
+  handler: async (ctx, a) => {
+    await requireAdmin(ctx);
+    const p = await ctx.db.get(a.playerId);
+    if (!p || p.retired || p.archived) throw new Error("Giocatore non attivo");
+    if (p.teamId === a.toTeamId) throw new Error("Il giocatore è già in questa squadra");
+    const to = await ctx.db.get(a.toTeamId);
+    if (!to || to.editionId !== p.editionId) throw new Error("Squadra non valida");
+    const number = a.newNumber ?? p.shirtNumber;
+    const mates = await ctx.db.query("players").withIndex("by_team", (q) => q.eq("teamId", a.toTeamId)).collect();
+    if (mates.some((x) => !x.retired && !x.archived && x.shirtNumber === number)) throw new Error("Numero di maglia già occupato nella nuova squadra");
+    await ctx.db.insert("transfers", { editionId: p.editionId, playerId: p._id, fromTeamId: p.teamId, toTeamId: a.toTeamId, date: a.date, note: a.note });
+    await ctx.db.patch(p._id, { teamId: a.toTeamId, shirtNumber: number });   // le statistiche restano con la squadra di allora (matchGoals.teamId)
+  },
+});
+
+// Chiude il torneo in corso (archivio) e ne crea uno nuovo, vuoto.
+export const createEdition = mutation({
+  args: { name: v.string(), year: v.number(), venue: v.optional(v.string()) },
+  handler: async (ctx, a) => {
+    await requireAdmin(ctx);
+    const cur = await activeEdition(ctx);
+    if (cur) await ctx.db.patch(cur._id, { status: "archived", closedAt: Date.now() });
+    const id = await ctx.db.insert("editions", { name: a.name, year: a.year, status: "active", venue: a.venue, awardsUnlocked: false, createdAt: Date.now() });
+    for (const [round, position] of [["semi", 1], ["semi", 2], ["final", 1]]) await ctx.db.insert("knockout", { editionId: id, round, position, legs: [] });
+    return id;
+  },
+});
+
+export const closeTournament = mutation({
+  args: {},
+  handler: async (ctx) => {
+    await requireAdmin(ctx);
+    const cur = await activeEdition(ctx);
+    if (!cur) throw new Error("Nessun torneo attivo");
+    await ctx.db.patch(cur._id, { status: "archived", closedAt: Date.now() });
+  },
+});
+
+// Il frontend la usa per sapere se chi e' collegato e' davvero admin (null = no). Il controllo vero resta in ogni mutation.
+export const me = query({
+  args: {},
+  handler: async (ctx) => {
+    try { const u = await requireAdmin(ctx); return { id: u._id }; } catch { return null; }
+  },
+});
+
+// Diagnosi dell'accesso: dice A CHE PUNTO si ferma (nessun dato sensibile), per capire cosa non va.
+export const authStatus = query({
+  args: {},
+  handler: async (ctx) => {
+    if (!(await ctx.auth.getUserIdentity())) return { ok: false, reason: "token-non-riconosciuto" };
+    try {
+      const userId = await getAuthUserId(ctx);
+      if (!userId) return { ok: false, reason: "sessione-non-trovata" };
+      const user = await ctx.db.get(userId);
+      return user ? { ok: true, reason: "ok" } : { ok: false, reason: "utente-non-trovato" };
+    } catch (e) { return { ok: false, reason: "errore-libreria: " + String(e?.message ?? e).slice(0, 160) }; }
+  },
+});
+
+// Elenchi completi (bozze comprese) visibili solo all'admin.
+export const listTop7 = query({
+  args: {},
+  handler: async (ctx) => {
+    await requireAdmin(ctx);
+    const ed = await activeEdition(ctx);
+    if (!ed) return [];
+    const all = (await ctx.db.query("top7").withIndex("by_edition", (q) => q.eq("editionId", ed._id)).collect()).sort((x, y) => y._creationTime - x._creationTime);
+    return await Promise.all(all.map(async (t) => ({ id: t._id, formation: t.formation, published: t.published, wasPublished: !!t.wasPublished, created: t._creationTime, names: await Promise.all([...t.slots].sort((p, q) => p.slot - q.slot).map(async (s) => (await ctx.db.get(s.playerId))?.lastName ?? "?")) })));
+  },
+});
+export const listFinalAwards = query({
+  args: {},
+  handler: async (ctx) => {
+    await requireAdmin(ctx);
+    const ed = await activeEdition(ctx);
+    if (!ed) return [];
+    const all = await ctx.db.query("finalAwards").withIndex("by_edition", (q) => q.eq("editionId", ed._id)).collect();
+    return await Promise.all(all.map(async (a) => { const p = await ctx.db.get(a.playerId); return { id: a._id, kind: a.kind, title: a.title, published: a.published, player: p ? `${p.firstName} ${p.lastName}` : "?" }; }));
+  },
+});
+
+export const listNews = query({
+  args: {},
+  handler: async (ctx) => {
+    await requireAdmin(ctx);
+    const ed = await activeEdition(ctx);
+    if (!ed) return [];
+    const rows = (await ctx.db.query("news").collect()).filter((n) => n.editionId === ed._id && !n.deleted).sort((x, y) => y._creationTime - x._creationTime);
+    return await Promise.all(rows.map(async (n) => ({ id: n._id, title: n.title, subtitle: n.subtitle ?? "", body: n.body, category: n.category, status: n.status, publishedAt: n.publishedAt ?? null, backgroundUrl: n.backgroundId ? await ctx.storage.getUrl(n.backgroundId) : null })));
+  },
+});
+export const listTransfers = query({
+  args: {},
+  handler: async (ctx) => {
+    await requireAdmin(ctx);
+    const ed = await activeEdition(ctx);
+    if (!ed) return [];
+    const rows = (await ctx.db.query("transfers").collect()).filter((t) => t.editionId === ed._id).sort((x, y) => y._creationTime - x._creationTime);
+    return await Promise.all(rows.map(async (t) => { const [p, f, to] = await Promise.all([ctx.db.get(t.playerId), ctx.db.get(t.fromTeamId), ctx.db.get(t.toTeamId)]); return { id: t._id, player: p ? `${p.firstName} ${p.lastName}` : "?", from: f?.name ?? "?", to: to?.name ?? "?", date: t.date, note: t.note ?? "" }; }));
+  },
+});

@@ -1,0 +1,4 @@
+Intestazione CSP (opzionale). NON provata su un browser vero: attivala solo dopo aver controllato che il sito funzioni (in particolare il collegamento a Convex).
+Aggiungi in sito-online/_headers, sotto "/*":
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: https:; connect-src 'self' https://*.convex.cloud wss://*.convex.cloud https://*.convex.site; object-src 'none'; base-uri 'none'; frame-ancestors 'none'
+Se dopo averla attivata qualcosa non si carica, toglila: il sito torna come prima.
